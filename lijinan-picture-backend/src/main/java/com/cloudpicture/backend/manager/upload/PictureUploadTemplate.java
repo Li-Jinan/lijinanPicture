@@ -5,6 +5,7 @@ import cn.hutool.core.date.DateUtil;
 import cn.hutool.core.io.FileUtil;
 import cn.hutool.core.util.NumberUtil;
 import cn.hutool.core.util.RandomUtil;
+import cn.hutool.core.util.StrUtil;
 import com.qcloud.cos.model.PutObjectResult;
 import com.qcloud.cos.model.ciModel.persistence.CIObject;
 import com.qcloud.cos.model.ciModel.persistence.ImageInfo;
@@ -15,9 +16,14 @@ import com.cloudpicture.backend.exception.ErrorCode;
 import com.cloudpicture.backend.manager.CosManager;
 import com.cloudpicture.backend.model.dto.file.UploadPictureResult;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 
 import javax.annotation.Resource;
+import javax.imageio.ImageIO;
+import java.awt.image.BufferedImage;
 import java.io.File;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
 import java.util.Date;
 import java.util.List;
 
@@ -32,6 +38,12 @@ public abstract class PictureUploadTemplate {
 
     @Resource
     private CosManager cosManager;
+
+    @Value("${local.upload.dir:/app/uploads}")
+    private String localUploadDir;
+
+    @Value("${local.upload.url-prefix:/uploads}")
+    private String localUploadUrlPrefix;
 
     /**
      * 上传图片
@@ -53,9 +65,12 @@ public abstract class PictureUploadTemplate {
         File file = null;
         try {
             // 3. 创建临时文件，获取文件到服务器
-            file = File.createTempFile(uploadPath, null);
+            file = File.createTempFile("picture-upload-", "." + FileUtil.getSuffix(originalFilename));
             // 处理文件来源
             processFile(inputSource, file);
+            if (isLocalUploadEnabled()) {
+                return uploadToLocal(originalFilename, file, uploadPath);
+            }
             // 4. 上传图片到对象存储
             PutObjectResult putObjectResult = cosManager.putPictureObject(uploadPath, file);
             // 5. 获取图片信息对象，封装返回结果
@@ -84,6 +99,58 @@ public abstract class PictureUploadTemplate {
             this.deleteTempFile(file);
         }
 
+    }
+
+    private boolean isLocalUploadEnabled() {
+        return StrUtil.hasBlank(cosClientConfig.getHost(), cosClientConfig.getSecretId(),
+                cosClientConfig.getSecretKey(), cosClientConfig.getRegion(), cosClientConfig.getBucket());
+    }
+
+    private UploadPictureResult uploadToLocal(String originalFilename, File file, String uploadPath) throws Exception {
+        String normalizedPath = uploadPath.startsWith("/") ? uploadPath.substring(1) : uploadPath;
+        File targetFile = new File(localUploadDir, normalizedPath);
+        FileUtil.mkParentDirs(targetFile);
+        Files.copy(file.toPath(), targetFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
+        BufferedImage image = ImageIO.read(targetFile);
+        if (image == null) {
+            throw new BusinessException(ErrorCode.PARAMS_ERROR, "图片解析失败");
+        }
+        UploadPictureResult uploadPictureResult = new UploadPictureResult();
+        String urlPrefix = localUploadUrlPrefix.endsWith("/")
+                ? localUploadUrlPrefix.substring(0, localUploadUrlPrefix.length() - 1)
+                : localUploadUrlPrefix;
+        uploadPictureResult.setUrl(urlPrefix + "/" + normalizedPath);
+        uploadPictureResult.setThumbnailUrl(uploadPictureResult.getUrl());
+        uploadPictureResult.setPicName(FileUtil.mainName(originalFilename));
+        uploadPictureResult.setPicSize(FileUtil.size(targetFile));
+        uploadPictureResult.setPicWidth(image.getWidth());
+        uploadPictureResult.setPicHeight(image.getHeight());
+        uploadPictureResult.setPicScale(NumberUtil.round(image.getWidth() * 1.0 / image.getHeight(), 2).doubleValue());
+        uploadPictureResult.setPicFormat(FileUtil.getSuffix(originalFilename));
+        uploadPictureResult.setPicColor(getAverageColor(image));
+        return uploadPictureResult;
+    }
+
+    private String getAverageColor(BufferedImage image) {
+        long red = 0;
+        long green = 0;
+        long blue = 0;
+        int count = 0;
+        int stepX = Math.max(1, image.getWidth() / 64);
+        int stepY = Math.max(1, image.getHeight() / 64);
+        for (int y = 0; y < image.getHeight(); y += stepY) {
+            for (int x = 0; x < image.getWidth(); x += stepX) {
+                int rgb = image.getRGB(x, y);
+                red += (rgb >> 16) & 0xff;
+                green += (rgb >> 8) & 0xff;
+                blue += rgb & 0xff;
+                count++;
+            }
+        }
+        if (count == 0) {
+            return "#FFFFFF";
+        }
+        return String.format("#%02X%02X%02X", red / count, green / count, blue / count);
     }
 
     /**
@@ -177,7 +244,6 @@ public abstract class PictureUploadTemplate {
         }
     }
 }
-
 
 
 
